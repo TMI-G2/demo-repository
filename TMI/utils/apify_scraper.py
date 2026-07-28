@@ -125,25 +125,98 @@ def fetch_instagram_comments(username: str, post_urls: list = None) -> list:
         return []
 
 
-# ── LINKEDIN (stub — ready to implement) ─────────────────────────────────────
+# ── LINKEDIN ──────────────────────────────────────────────────────────────────
 
-def fetch_linkedin_profile(profile_url: str) -> dict:
+def fetch_linkedin_profile(identifier: str) -> dict:
     """
-    TODO: Implement LinkedIn profile scraping.
+    Fetch LinkedIn profile metadata via Apify (harvestapi/linkedin-profile-scraper).
 
-    Steps:
-      1. Add "linkedin_profile" actor ID to config.APIFY_ACTORS
-      2. Implement scraping logic matching the pattern above
-      3. Return the same normalised dict structure with platform="linkedin"
+    `identifier` can be either:
+      - a public identifier / slug, e.g. "williamhgates"
+        (the part after linkedin.com/in/)
+      - a full profile URL, e.g. "https://www.linkedin.com/in/williamhgates"
 
-    Key fields to extract:
-      full_name, headline, location, about (bio), experience,
-      education, connections_count, profile_url
+    Returns a normalised dict or empty dict on failure. LinkedIn profiles are
+    always public by definition of this actor (no login-gated private scraping),
+    so is_private is always False / account_visibility is always "public".
     """
-    raise NotImplementedError(
-        "LinkedIn transform not yet implemented. "
-        "See utils/apify_scraper.py fetch_linkedin_profile() stub."
-    )
+    log.info("[Apify/LinkedIn] Fetching profile '%s'", identifier)
+    client = get_client()
+
+    is_url = identifier.strip().lower().startswith("http") or "linkedin.com" in identifier.lower()
+    run_input = {"urls": [identifier]} if is_url else {"publicIdentifiers": [identifier]}
+
+    try:
+        run = client.actor(config.APIFY_ACTORS["linkedin_profile"]).call(run_input=run_input)
+        items = list(client.dataset(run.default_dataset_id).iterate_items())
+        if not items:
+            log.warning("[Apify/LinkedIn] No data for '%s'", identifier)
+            return {}
+
+        raw = items[0]
+
+        first_name = raw.get("firstName", "") or ""
+        last_name  = raw.get("lastName", "") or ""
+        full_name  = sanitise(f"{first_name} {last_name}".strip())
+
+        username = raw.get("publicIdentifier", identifier)
+
+        location_obj = raw.get("location", {}) or {}
+        location = sanitise(
+            location_obj.get("linkedinText")
+            or (location_obj.get("parsed") or {}).get("text", "")
+        )
+
+        current_position_list = raw.get("currentPosition", []) or []
+        experience_list        = raw.get("experience", []) or []
+
+        current_company = ""
+        if current_position_list:
+            current_company = sanitise(current_position_list[0].get("companyName", ""))
+        elif experience_list:
+            current_company = sanitise(experience_list[0].get("companyName", ""))
+
+        current_position = ""
+        if experience_list:
+            current_position = sanitise(experience_list[0].get("position", ""))
+
+        education_list = raw.get("education", []) or []
+        schools = [
+            sanitise(e.get("schoolName", ""))
+            for e in education_list
+            if e.get("schoolName")
+        ]
+
+        profile_url = raw.get("linkedinUrl", "") or f"https://www.linkedin.com/in/{username}/"
+
+        profile = {
+            "platform":           "linkedin",
+            "username":           username,
+            "full_name":          full_name,
+            "bio":                sanitise(raw.get("about", "")),
+            "headline":           sanitise(raw.get("headline", "")),
+            "location":           location,
+            "current_position":   current_position,
+            "current_company":    current_company,
+            "schools":            schools,
+            "followers":          raw.get("followerCount", 0) or 0,
+            "connections":        raw.get("connectionsCount", 0) or 0,
+            "is_private":         False,
+            "account_visibility": "public",
+            "profile_url":        profile_url,
+            "following_list":     [],
+            "post_urls":          [],
+        }
+
+        log.info(
+            "[Apify/LinkedIn] %s | connections=%d | followers=%d",
+            profile["username"], profile["connections"], profile["followers"],
+        )
+        return profile
+
+    except Exception as exc:
+        log.error("[Apify/LinkedIn] Failed for '%s': %s", identifier, exc)
+        return {}
 
 
 # ── TWITTER/X ─────────────────────────────────────────────────────────────────
@@ -163,7 +236,8 @@ def fetch_twitter_profile(username: str) -> dict:
 
     try:
         run = client.actor(config.APIFY_ACTORS["twitter_profile"]).call(run_input={
-            "usernames": [username],
+            "startUrls": [f"https://x.com/{username}"],
+            "onlyUserInfo": True,
         })
         items = list(client.dataset(run.default_dataset_id).iterate_items())
         if not items:
@@ -172,10 +246,7 @@ def fetch_twitter_profile(username: str) -> dict:
 
         raw = items[0]
 
-        # Skip if account not found
-        if raw.get("status") != "available":
-            log.warning("[Apify/Twitter] @%s status: %s", username, raw.get("status"))
-            return {}
+
 
         profile = {
             "platform":           "twitter",
