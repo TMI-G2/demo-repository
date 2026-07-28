@@ -1,168 +1,101 @@
-# Maltego Risk Transform Server — Setup Guide
+# TMI — Know Your Exposure
 
-## Project structure
+TMI is a privacy risk-scoring utility that assesses public social media profiles for personally identifiable information (PII) and security exposure.
+
+## Overview
+
+TMI functions strictly as an awareness-building utility rather than a surveillance engine. It accesses exclusively publicly visible information — never bypassing privacy settings or requiring logins — and operates on a self-service model where users check their own accounts.
+
+Profile scoring is powered entirely by a local LLM (Ollama), so profile data never leaves your network for the scoring step. The only external call is to Apify's public scraping actors, which is required to pull the public profile data in the first place. A full assessment typically completes in 10–90 seconds, depending on the platform and how much data is scraped.
+
+## Key Features
+
+- **Multi-platform support** — scans public profiles on Instagram, Twitter/X, and LinkedIn.
+- **Platform-specific rubrics** — each platform is scored against its own 100-point rubric, built only from the data that platform actually exposes (see `config.py` for the full rationale behind each category).
+- **Deterministic + LLM hybrid scoring** — categories with a clear, factual answer (account visibility, post count, regex-confirmed PII like emails/phones) are scored programmatically rather than left to the model; everything else (bio tone, comment content, professional exposure) is judged by the local LLM.
+- **PII pre-scanner** — a regex/keyword pass over bio text catches emails, phone numbers, ages, grade levels, and institution names before the LLM even runs, and those findings are treated as confirmed facts in scoring.
+- **Async job-based web UI** — submit a username, poll for results, and get a score breakdown with evidence and recommendations, without blocking the request.
+
+## Project Structure
 
 ```
-maltego_transforms/
-├── server.py                        ← Start this first, then open Maltego
-├── config.py                        ← All settings live here
-├── requirements.txt
-│
-├── transforms/
-│   ├── __init__.py                  ← Controls which platforms are active
-│   ├── instagram_transform.py       ← ✅ Active
-│   ├── linkedin_transform.py        ← 🔲 Stub (ready to implement)
-│   ├── facebook_transform.py        ← 🔲 Stub (ready to implement)
-│   └── twitter_transform.py         ← 🔲 Stub (ready to implement)
-│
-└── utils/
-    ├── apify_scraper.py             ← All Apify scraping logic
-    ├── ollama_scorer.py             ← Local Ollama LLM scoring
-    └── entity_builder.py           ← Builds Maltego graph entities
+.
+├── webapp.py               # Flask front-end (port 5001) — UI, job queue, API endpoints
+├── config.py                # API credentials, Ollama settings, platform risk rubrics
+├── utils/
+│   ├── apify_scraper.py     # Apify scraping functions (Instagram, Twitter/X, LinkedIn)
+│   └── ollama_scorer.py     # Local Ollama scoring engine, PII pre-scanner, rubric logic
+└── TMI-pfp.png               # Logo served at /logo.png (place next to webapp.py)
 ```
 
----
+## Prerequisites
 
-## Step 1 — Install dependencies
+- Python 3.8+
+- [Ollama](https://ollama.com/) installed and running, with the `qwen2.5vl:7b` model pulled
+- An active [Apify](https://apify.com/) API token
+- Python packages: `flask`, `apify-client`, `ollama` (install via `pip install flask apify-client ollama`)
 
-```powershell
-pip install -r requirements.txt
+## Installation & Configuration
+
+1. **Set your Apify API token** as an environment variable.
+
+   PowerShell:
+   ```powershell
+   $env:APIFY_API_TOKEN = "apify_api_xxxx"
+   ```
+
+   macOS/Linux:
+   ```bash
+   export APIFY_API_TOKEN="apify_api_xxxx"
+   ```
+
+2. **Pull the Ollama model** used for scoring:
+   ```bash
+   ollama pull qwen2.5vl:7b
+   ```
+
+3. **Review `config.py`** and adjust as needed:
+   - `OLLAMA_HOST` / `OLLAMA_PORT` — where your Ollama instance is reachable (defaults to a Tailscale IP; change to `127.0.0.1` if running Ollama on the same machine as the web app).
+   - `MAX_COMMENTS` — cap on Instagram comments pulled per profile.
+   - `APIFY_ACTORS` — Apify actor IDs used for each platform's scraper.
+
+## Running the Web Application
+
+```bash
+python webapp.py
 ```
 
----
+Then open in your browser:
 
-## Step 2 — Set your Apify token
+- **Desktop:** `http://localhost:5001`
+- **Another device via Tailscale:** `http://100.x.x.x:5001`
 
-```powershell
-$env:APIFY_API_TOKEN = "apify_api_your_token_here"
-```
+Enter a username (or LinkedIn public identifier/URL), pick a platform, and submit. The app scrapes the public profile via Apify, runs it through the local Ollama scoring engine, and returns a risk score (0–100) with a category breakdown, supporting evidence, and recommendations.
 
-To make this permanent (survives restarts), add it to your Windows
-system environment variables:
-  Start → Search "Environment Variables" → User variables → New
+## How Scoring Works
 
----
+1. **Scrape** — `utils/apify_scraper.py` fetches the target's public profile (and, for Instagram public accounts, recent comments) via Apify.
+2. **Pre-scan** — `utils/ollama_scorer.py` regex-scans the bio for confirmed PII (email, phone, age, grade, institution, location) before any LLM call.
+3. **Score** — the profile, pre-scan findings, and platform-specific rubric are sent to the local Ollama model, which returns a JSON breakdown across every rubric category.
+4. **Override deterministic categories** — categories backed by hard facts (account visibility, post count, regex-confirmed PII) are recalculated in code and overwrite the model's values, since these don't need — and shouldn't rely on — LLM judgment.
+5. **Total & risk level** — category scores are summed to a 0–100 total, mapped to a risk level:
 
-## Step 3 — Make sure Ollama is running
+   | Score  | Risk Level |
+   |--------|------------|
+   | 0–19   | LOW        |
+   | 20–44  | MEDIUM     |
+   | 45–69  | HIGH       |
+   | 70–100 | CRITICAL   |
 
-Look for the Ollama icon in your system tray (bottom-right).
-If it's not there, start Ollama from the Start menu.
+## Adding a New Platform
 
-Confirm your model is pulled:
-```powershell
-ollama list
-```
-You should see `llama3.1:8b` or `qwen2.5:14b` in the list.
-If not: `ollama pull llama3.1:8b`
+1. Add the platform's Apify actor ID to `APIFY_ACTORS` in `config.py`.
+2. Write a `fetch_<platform>_profile()` function in `utils/apify_scraper.py` that returns a normalised profile dict.
+3. Add a rubric for the platform to `config.py` and register it in `PLATFORM_RUBRICS`, scoping every category strictly to data that function actually returns.
+4. Wire the new fetch function into `webapp.py`'s `/api/check` and `_run_pipeline`.
 
----
+## Notes
 
-## Step 4 — Start the transform server
-
-```powershell
-cd maltego_transforms
-python server.py
-```
-
-You should see:
-```
-✓ Apify token found
-✓ Ollama running | model: llama3.1:8b
-Registered transforms:
-  → Instagram: Assess Risk Profile
-Server starting on http://localhost:8080
-Keep this window open while using Maltego.
-```
-
-Leave this terminal open the entire time you use Maltego.
-
----
-
-## Step 5 — Register the server in Maltego
-
-1. Open Maltego desktop client
-2. Go to: **Maltego menu (top-left)** → **Settings** → **Transform Manager**
-3. Click **"New Local Transform Server"** (or Add)
-4. Fill in:
-   - Name: `Social Media Risk Assessment`
-   - URL: `http://localhost:8080/`
-   - Click **Test Connection** — should say "Connected"
-5. Click **Discover Transforms**
-   - Maltego will pull the transform list from the server
-   - You should see `Instagram: Assess Risk Profile` appear
-
----
-
-## Step 6 — Run your first transform in Maltego
-
-1. Drag a **Person** entity onto the graph
-2. Set its **Value** to an Instagram handle (e.g. `nasa` or `@nasa`)
-3. **Right-click** the entity
-4. Click **Other Transforms** → **Social Media Risk Assessment** →
-   **Instagram: Assess Risk Profile**
-5. The transform runs — watch the server terminal for live logs
-6. A new colour-coded entity appears on the graph:
-   - 🔴 Red = CRITICAL risk
-   - 🟠 Orange = HIGH risk
-   - 🟡 Yellow = MEDIUM risk
-   - 🟢 Green = LOW risk
-7. Click the entity to inspect all properties (score, evidence, recommendations)
-
----
-
-## Adding a new platform later
-
-When you're ready to add LinkedIn, Facebook, or Twitter:
-
-### 1. Add the Apify actor ID to `config.py`
-```python
-APIFY_ACTORS = {
-    "instagram_profile":  "apify/instagram-profile-scraper",
-    "instagram_comments": "apify/instagram-comment-scraper",
-    "linkedin_profile":   "apify/linkedin-profile-scraper",  # ← add this
-}
-```
-
-### 2. Implement the scraping function in `utils/apify_scraper.py`
-Follow the `fetch_instagram_profile()` pattern exactly.
-The function must return a dict with at least: `platform`, `username`,
-`bio`, `is_private`, `profile_url`.
-
-### 3. Uncomment the decorator in the platform's transform file
-In `transforms/linkedin_transform.py`, uncomment:
-```python
-from maltego_trx import registry
-@registry.register_transform(...)
-```
-
-### 4. Uncomment the import in `transforms/__init__.py`
-```python
-from transforms.linkedin_transform import LinkedInRiskTransform
-```
-
-### 5. Restart the server and click Discover Transforms in Maltego
-The new transform appears automatically. No other changes needed.
-
----
-
-## Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| `Apify token not set` | Run `$env:APIFY_API_TOKEN = "..."` in the same terminal |
-| `Cannot reach Ollama` | Check system tray — start Ollama if icon is missing |
-| `Model not found` | Run `ollama pull llama3.1:8b` |
-| Transform not appearing in Maltego | Click Discover Transforms again after server restart |
-| `Could not fetch @username` | Check handle is correct and account is public |
-| JSON parse error in logs | Profile had unusual bio — model's fallback extractor handles it |
-
----
-
-## Data privacy summary
-
-| Step | Goes online? |
-|---|---|
-| Apify scrape | ✅ Yes — Apify servers fetch Instagram data |
-| Risk scoring (Ollama) | ❌ No — runs entirely on your RTX 5070 |
-| Maltego graph entities | ❌ No — local Community Edition only |
-| Output files | ❌ No — saved to your disk only |
+- Only public data is scraped — no login credentials, cookies, or authenticated sessions are used for any platform.
+- LinkedIn profiles reachable by the scraper are public by definition, so there is no "private account" category for LinkedIn.
+- Instagram's `account_hygiene` and all platforms' `private_account`/regex-confirmed PII categories are intentionally scored deterministically rather than by the LLM, since arithmetic and simple thresholds are more reliable done in code.
